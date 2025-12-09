@@ -7,3 +7,5 @@ numpy
 SpeechRecognition
 langdetect
 gunicorn
+audioread
+scipy
