@@ -1,4 +1,9 @@
 Flask
-flask-cors
+Flask-Cors
 requests
+librosa
+soundfile
+numpy
+SpeechRecognition
+langdetect
 gunicorn
