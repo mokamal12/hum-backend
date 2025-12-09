@@ -3,7 +3,4 @@ flask-cors
 requests
 soundfile
 numpy
-SpeechRecognition
-langdetect
 gunicorn
-librosa
