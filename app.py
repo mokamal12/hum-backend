@@ -1,31 +1,28 @@
 import os
 import json
-import tempfile
 import math
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import tempfile
+import urllib.parse
 
 import requests
 import soundfile as sf
 import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from bs4 import BeautifulSoup
 
-# --------------------
+# ==============================
 # CONFIG
-# --------------------
+# ==============================
 AUDD_API_KEY = os.getenv("bb413cb2c6c98518d943fb4ed00276e1")
 
 app = Flask(__name__)
 CORS(app)
 
 
-# --------------------
-# AUDIO UTIL – LOUDNESS
-# --------------------
-def rms_dbfs(audio_path):
-    """
-    Compute loudness in dBFS to detect whisper / too-quiet input.
-    """
+# ---------- Utility: loudness check ----------
+def rms_dbfs(audio_path: str) -> float:
+    """Compute loudness in dBFS to detect whisper / too-quiet input."""
     data, sr = sf.read(audio_path)
     if data.ndim > 1:
         data = np.mean(data, axis=1)
@@ -38,11 +35,15 @@ def rms_dbfs(audio_path):
     return db
 
 
-# --------------------
-# AUDD INTEGRATION
-# --------------------
-def call_audd(file_path):
-    """Send audio file to Audd.io and return JSON."""
+# ---------- Audd.io recognition ----------
+def call_audd(file_path: str):
+    """
+    Send audio file to Audd.io.
+    This handles:
+      - Played song (like Shazam)
+      - Singing with lyrics
+      - Humming (if Audd can catch it)
+    """
     url = "https://api.audd.io/"
     data = {
         "api_token": AUDD_API_KEY,
@@ -70,23 +71,23 @@ def simplify_audd_result(audd_json):
         "artist": s.get("artist"),
         "album": s.get("album"),
         "timecode": s.get("timecode"),
-        "lyrics_snippet": None,
+        "lyrics_full": None,
         "cover": None,
         "links": {},
     }
 
-    # Lyrics snippet – keep UTF-8
+    # Lyrics (UTF-8 safe)
     lyrics = s.get("lyrics")
     if isinstance(lyrics, str) and lyrics.strip():
-        out["lyrics_snippet"] = lyrics[:400] + ("…" if len(lyrics) > 400 else "")
+        out["lyrics_full"] = lyrics
 
-    # Apple Music cover
+    # Apple Music artwork
     am = s.get("apple_music") or {}
     am_art = am.get("artwork") or {}
     if am_art.get("url"):
         out["cover"] = am_art["url"]
 
-    # Spotify cover fallback
+    # Spotify artwork fallback
     sp = s.get("spotify") or {}
     sp_album = sp.get("album") or {}
     sp_images = sp_album.get("images") or []
@@ -105,103 +106,142 @@ def simplify_audd_result(audd_json):
     return out
 
 
-# --------------------
-# iTunes SEARCH + SCORING FOR LYRICS
-# --------------------
-def jaccard_similarity(a, b):
-    sa = set(a)
-    sb = set(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def search_itunes_by_lyrics(lyrics, language, era):
+# ---------- Genius helpers (optional, best effort) ----------
+def genius_search_song(query: str):
     """
-    Use lyrics text as the query to iTunes Search API.
-    language: 'arabic' or 'english'
-    era: 'old' or 'modern'
+    Use Genius search page to find a song URL.
+    This is not an official API but usually works.
+    """
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://genius.com/api/search/multi?per_page=5&q={q}"
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+    except Exception:
+        return None
+
+    sections = data.get("response", {}).get("sections", [])
+    for section in sections:
+        if section.get("type") == "song":
+            hits = section.get("hits", [])
+            if not hits:
+                continue
+            song = hits[0].get("result", {})
+            path = song.get("path")
+            title = song.get("title")
+            artist = song.get("primary_artist", {}).get("name")
+            if path:
+                return {
+                    "url": "https://genius.com" + path,
+                    "title": title,
+                    "artist": artist,
+                }
+
+    return None
+
+
+def genius_fetch_lyrics(url: str) -> str | None:
+    """
+    Scrape full lyrics text from a Genius song page.
+    """
+    try:
+        resp = requests.get(url, timeout=20)
+        html = resp.text
+        soup = BeautifulSoup(html, "lxml")
+        containers = soup.find_all("div", attrs={"data-lyrics-container": "true"})
+        if not containers:
+            return None
+        parts = []
+        for c in containers:
+            parts.append(c.get_text(separator="\n"))
+        full = "\n".join(parts)
+        return full.strip()
+    except Exception:
+        return None
+
+
+def extract_next_lines(full_lyrics: str, max_lines: int = 4) -> list[str]:
+    """
+    Very simple: return first N non-empty lines after the first stanza.
+    This is a placeholder for "next 4 bars".
+    """
+    if not full_lyrics:
+        return []
+
+    raw_lines = [line.strip() for line in full_lyrics.splitlines()]
+    lines = [ln for ln in raw_lines if ln]
+
+    # Just take first N non-empty lines
+    return lines[:max_lines]
+
+
+def build_fun_fact_from_song(song: dict) -> str | None:
+    if not song:
+        return None
+    pieces = []
+    title = song.get("title") or ""
+    artist = song.get("artist") or ""
+    if title and artist:
+        pieces.append(f"This match is \"{title}\" by {artist}.")
+    elif title:
+        pieces.append(f"This track is titled \"{title}\".")
+    elif artist:
+        pieces.append(f"This track is performed by {artist}.")
+    if not pieces:
+        return None
+    return " ".join(pieces)
+
+
+# ---------- Simple iTunes lyrics-based search ----------
+def search_itunes_by_lyrics(lyrics: str, language: str):
+    """
+    Use iTunes as a free DB. We query by lyrics snippet.
     """
     if not lyrics:
         return []
 
-    # keep only first ~8–10 words to avoid long queries
     tokens = lyrics.strip().split()
     if len(tokens) > 10:
         tokens = tokens[:10]
     query = " ".join(tokens)
 
-    # country based on language
-    if language == "arabic":
-        country = "eg"  # Egypt store
-    else:
-        country = "us"
+    # Rough language mapping
+    country = "eg" if language == "arabic" else "us"
 
     params = {
         "term": query,
         "entity": "song",
-        "limit": 25,
+        "limit": 20,
         "country": country,
         "media": "music",
     }
 
-    resp = requests.get("https://itunes.apple.com/search", params=params, timeout=20)
     try:
+        resp = requests.get("https://itunes.apple.com/search", params=params, timeout=20)
         data = resp.json()
     except Exception:
         return []
 
     results = []
     for item in data.get("results", []):
-        track_name = item.get("trackName")
-        artist = item.get("artistName")
-        album = item.get("collectionName")
-        cover = item.get("artworkUrl100")
-        preview = item.get("previewUrl")
-        release_date = item.get("releaseDate", "")
-        duration_ms = item.get("trackTimeMillis")
-
-        year = None
-        if release_date:
-            try:
-                year = int(release_date[:4])
-            except Exception:
-                year = None
-
-        # Era filter
-        if era == "old" and year is not None and year >= 2005:
-            continue
-        if era == "modern" and year is not None and year < 2005:
-            continue
-
         results.append(
             {
-                "title": track_name,
-                "artist": artist,
-                "album": album,
-                "cover": cover,
-                "preview_url": preview,
-                "release_year": year,
-                "duration_ms": duration_ms,
+                "title": item.get("trackName"),
+                "artist": item.get("artistName"),
+                "album": item.get("collectionName"),
+                "cover": item.get("artworkUrl100"),
+                "preview_url": item.get("previewUrl"),
+                "release_year": int(item["releaseDate"][:4]) if item.get("releaseDate") else None,
+                "duration_ms": item.get("trackTimeMillis"),
             }
         )
-
     return results
 
 
-def score_song(song, lyrics_tokens):
-    """
-    Score by overlap between lyrics tokens and (title + artist).
-    """
-    title = (song.get("title") or "").lower()
-    artist = (song.get("artist") or "").lower()
-    all_text = (title + " " + artist).split()
-    return float(jaccard_similarity(lyrics_tokens, all_text))
-
-
-# --------------------
+# ==============================
 # ROUTES
-# --------------------
+# ==============================
+
 @app.get("/")
 def home():
     return jsonify(
@@ -216,8 +256,10 @@ def home():
 @app.post("/identify")
 def identify():
     """
-    Audio-based identification (humming or singing).
-    Uses Audd. This is used when browser STT fails (humming).
+    Raw audio → Audd (played song, singing, humming).
+    Used when:
+      - Lyrics recognition on frontend failed
+      - Or user just hummed
     """
     if "file" not in request.files:
         return jsonify({"error": "no file uploaded"}), 400
@@ -230,7 +272,9 @@ def identify():
 
     try:
         loudness = rms_dbfs(tmp_path)
+
         if loudness < -45.0:
+            # Too quiet → whisper
             return jsonify(
                 {
                     "status": "quiet",
@@ -242,86 +286,136 @@ def identify():
         audd_raw = call_audd(tmp_path)
         simplified = simplify_audd_result(audd_raw)
 
-        if simplified is not None:
-            return app.response_class(
-                response=json.dumps(
-                    {
-                        "status": "match",
-                        "song": simplified,
-                    },
-                    ensure_ascii=False,
-                ),
-                status=200,
-                mimetype="application/json",
+        if simplified is None:
+            return jsonify(
+                {
+                    "status": "no_match",
+                    "message": "No exact match from Audd",
+                }
             )
-        else:
-            return app.response_class(
-                response=json.dumps(
-                    {
-                        "status": "no_match",
-                        "message": "No exact match from Audd",
-                    },
-                    ensure_ascii=False,
-                ),
-                status=200,
-                mimetype="application/json",
-            )
+
+        # Try to get full lyrics from Genius, if we know title+artist
+        genius_next_lines = []
+        if simplified["title"] and simplified["artist"]:
+            query = f'{simplified["title"]} {simplified["artist"]}'
+            g_song = genius_search_song(query)
+            if g_song and g_song.get("url"):
+                full_lyrics = genius_fetch_lyrics(g_song["url"])
+                genius_next_lines = extract_next_lines(full_lyrics, max_lines=4)
+
+        # Fallback: use Audd lyrics if Genius fails
+        if not genius_next_lines and simplified["lyrics_full"]:
+            raw_lines = [ln.strip() for ln in simplified["lyrics_full"].splitlines()]
+            genius_next_lines = [ln for ln in raw_lines if ln][:4]
+
+        fun_fact = build_fun_fact_from_song(simplified)
+
+        payload = {
+            "status": "match",
+            "song": {
+                "title": simplified["title"],
+                "artist": simplified["artist"],
+                "album": simplified["album"],
+                "cover": simplified["cover"],
+                "links": simplified["links"],
+            },
+            "next_lines": genius_next_lines,
+            "fun_fact": fun_fact,
+        }
+
+        return app.response_class(
+            response=json.dumps(payload, ensure_ascii=False),
+            status=200,
+            mimetype="application/json",
+        )
+
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
 @app.post("/lyrics")
-def lyrics_search():
+def lyrics_route():
     """
-    Lyrics-based identification.
-    This is called from the frontend after browser speech recognition
-    (Arabic/English) gets the text.
+    Lyrics text → best guess (lyrics-first mode).
+    Frontend sends:
+      - lyrics (transcript from browser speech)
+      - language (arabic/english/auto)
+      - era, gender (for future ranking refinement, currently informational)
     """
     data = request.get_json(silent=True) or {}
-    lyrics = data.get("lyrics") or ""
-    language = data.get("language") or "english"  # 'arabic' or 'english'
-    era = data.get("era") or "modern"             # 'old' or 'modern'
-    gender = data.get("gender") or "unknown"      # not used yet, kept for future
+    lyrics = (data.get("lyrics") or "").strip()
+    language = data.get("language") or "english"
+    era = data.get("era") or "modern"
+    gender = data.get("gender") or "unknown"
 
-    lyrics = lyrics.strip()
     if not lyrics:
         return jsonify({"status": "error", "message": "Empty lyrics"}), 400
 
-    # basic tokenization
-    raw_tokens = lyrics.lower().split()
-    lyrics_tokens = [t for t in raw_tokens if len(t) > 2]
+    # 1) Try Genius search for the lyrics
+    g_song = genius_search_song(lyrics)
+    next_lines = []
+    song_meta = None
 
-    songs = search_itunes_by_lyrics(lyrics, language, era)
+    if g_song and g_song.get("url"):
+        full_lyrics = genius_fetch_lyrics(g_song["url"])
+        next_lines = extract_next_lines(full_lyrics, max_lines=4)
+        song_meta = {
+            "title": g_song.get("title"),
+            "artist": g_song.get("artist"),
+            "album": None,
+            "cover": None,
+            "links": {},
+        }
 
-    scored = []
-    for s in songs:
-        sc = score_song(s, lyrics_tokens)
-        ss = dict(s)
-        ss["score"] = sc
-        scored.append(ss)
+    # 2) iTunes for popularity & extra suggestions
+    itunes_results = search_itunes_by_lyrics(lyrics, language)
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    best_match = scored[0] if scored else None
+    best_match = None
+    if itunes_results:
+        best_match = itunes_results[0]
+        if not song_meta:
+            song_meta = {
+                "title": best_match.get("title"),
+                "artist": best_match.get("artist"),
+                "album": best_match.get("album"),
+                "cover": best_match.get("cover"),
+                "links": {},
+            }
+        else:
+            if not song_meta.get("cover") and best_match.get("cover"):
+                song_meta["cover"] = best_match["cover"]
+
+    if not song_meta:
+        return jsonify(
+            {
+                "status": "no_match",
+                "message": "No clear song matched these lyrics.",
+                "results": itunes_results,
+            }
+        )
+
+    fun_fact = build_fun_fact_from_song(song_meta)
+
+    payload = {
+        "status": "ok",
+        "language": language,
+        "era": era,
+        "gender": gender,
+        "lyrics_used": lyrics,
+        "song": song_meta,
+        "next_lines": next_lines,
+        "fun_fact": fun_fact,
+        "results": itunes_results,
+    }
 
     return app.response_class(
-        response=json.dumps(
-            {
-                "status": "ok",
-                "language": language,
-                "era": era,
-                "gender": gender,
-                "lyrics_used": lyrics,
-                "best_match": best_match,
-                "results": scored,
-            },
-            ensure_ascii=False,
-        ),
+        response=json.dumps(payload, ensure_ascii=False),
         status=200,
         mimetype="application/json",
     )
 
 
 if __name__ == "__main__":
-    # For local testing; Railway uses gunicorn
+    # Local testing; Railway uses gunicorn
     app.run(host="0.0.0.0", port=5000, debug=True)
